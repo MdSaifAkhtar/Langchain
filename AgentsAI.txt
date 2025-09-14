@@ -1,0 +1,178 @@
+import ast,re,math,os,sys
+os.environ["euri-api-key"] ="euri-2a913306ad38ca08872c440188785aa42c4f1cc0632c45b431b90cc0ea398992"
+from euriai.langchain import create_chat_model
+from langchain.agents import create_react_agent,AgentExecutor
+from langchain_core.prompts import PromptTemplate,ChatPromptTemplate,MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough,RunnableLambda,RunnableWithMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory ,InMemoryChatMessageHistory as ChatMessageHistory
+from langchain_core.tools import BaseTool,tool
+from langchain.memory import (
+    ConversationBufferMemory,
+    ConversationBufferWindowMemory,
+    ConversationSummaryMemory,
+    CombinedMemory,
+    ReadOnlySharedMemory,
+    ConversationEntityMemory
+
+)
+
+llm_default = create_chat_model(
+    api_key="euri-0bb40e5a08a77c621339ad2df168d7fa2d0184513bf2403556522a463c4b4236",
+    model="gpt-4.1-nano",
+    temperature=0.2
+)
+
+
+
+
+
+@tool("calculator", return_direct=True)
+def calculator(expression: str) -> str:
+    """Evaluate a numeric math expression. Supports +, -, *, /, **, parentheses, and all mathematical functions."""
+    # NOTE: Using eval can be a security risk. While the allowed_nodes and allowed_names lists
+    # provide some protection, it is generally recommended to use a safer alternative.
+    allowed_nodes = (
+        ast.Expression, ast.UnaryOp, ast.unaryop, ast.BinOp, ast.operator,
+        ast.Num, ast.Load, ast.pow, ast.FunctionDef, ast.Module, ast.Expr,
+        ast.Call, ast.Name, ast.arguments, ast.args, ast.Constant
+    )
+    allowed_names = {k: v for k, v in vars(math).items() if not k.startswith("_")}
+    allowed_names.update({"abs": abs, "round": round, "min": min, "max": max})
+    node = ast.parse(expression, mode="eval")
+
+    for n in ast.walk(node):
+        if not isinstance(n, allowed_nodes):
+            raise ValueError(f"Expression contains invalid node {type(n)}")
+        if isinstance(n, ast.Name) and n.id not in allowed_names:
+            raise ValueError(f"Expression contains invalid name {n.id}")
+    code = compile(node, "<string>", "eval")
+    return str(eval(code, {"_builtins_": {}}, allowed_names))
+
+tools_math = [calculator]
+
+react_prompt_math = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a precise math assistant. You can use these tools:\n{tools}\n"
+     "When you are going to use these tools, follow this format exactly:\n"
+     "Questions: ...\nThought: ...\nAction by using one of the tools access that you have [{tool_names}]\n"
+     "Always finish with a final numeric answer to the question."
+    ),
+    ("human", "questions: {input}\n{agent_scratchpad}")
+])
+
+agent_math = create_react_agent(
+    llm=llm_default,
+    prompt=react_prompt_math,
+    tools=tools_math
+)
+
+memory_math = ConversationBufferMemory(
+    memory_key="chat_history",
+    return_messages=True,
+    input_key="input",
+    output_key="output",
+)
+
+math_executor = AgentExecutor(
+    agent=agent_math,
+    tools=tools_math,
+    memory=memory_math,
+    verbose=True,
+    handle_parsing_errors="You did not follow the instruction that I have given you to use the tools."
+)
+
+# --- Knowledge Base Tool and KB Agent ---
+
+@tool("kb_search", return_direct=True)
+def kb_search(query: str) -> str:
+    """A mock function to search from a knowledge base"""
+    knowledge_base = {
+        "what is the capital of france": "The capital of France is Paris.",
+        "who is the president of the united states": "The president of the United States is Joe Biden.",
+        "what is the largest mammal": "The largest mammal is the blue whale.",
+    }
+    return knowledge_base.get(query.lower(), "I don't know the answer to that question.")
+
+tools_kb = [kb_search]
+
+react_prompt_kb = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a helpful assistant that can answer questions based on your knowledge base. You can use the following tools:\n{tools}\n"
+     "When you are going to use these tools, follow this format exactly:\n"
+     "Questions: ...\nThought: ...\nAction by using one of the tools access that you have [{tool_names}]\n"
+     "Always finish with a final answer to the question."
+    ),
+    ("human", "questions: {input}\n{agent_scratchpad}")
+])
+
+agent_kb = create_react_agent(
+    llm=llm_default,
+    prompt=react_prompt_kb,
+    tools=tools_kb
+)
+
+mem_kb = ConversationBufferWindowMemory(
+    memory_key="chat_history",
+    return_messages=True,
+    input_key="input",
+    output_key="output",
+    k=5
+)
+
+kb_executor = AgentExecutor(
+    agent=agent_kb,
+    tools=tools_kb,
+    memory=mem_kb,
+    verbose=True,
+    handle_parsing_errors="You did not follow the instruction that I have given you to use the KB tools."
+)
+
+# --- Router and Orchestrator ---
+
+router_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a router. Read the user message and output exactly one token for the input given by users:\n"
+     "- MATH if user is asking for calculations \n"
+     "- KB if user is asking for general knowledge questions \n"
+     "Output only KB or MATH nothing else from your side."
+    ),
+    ("human", "{input}")
+])
+
+# FIX: Chain the prompt with the LLM and a string output parser
+router_chain = router_prompt | llm_default | StrOutputParser()
+
+def _dispatcher(inputs: dict):
+    """Takes user input and routes it based on prompt classification."""
+    user_msg = inputs["input"]
+    choice = router_chain.invoke({"input": user_msg}).upper().strip()
+
+    if choice == "MATH":
+        return math_executor.invoke({"input": user_msg})
+    elif choice == "KB":
+        return kb_executor.invoke({"input": user_msg})
+    else:
+        return {"output": "I can only answer math and KB-related questions."}
+
+dispatcher = RunnableLambda(_dispatcher)
+
+_session = {}
+
+def _get_history(session_id: str):
+    if session_id not in _session:
+        _session[session_id] = ChatMessageHistory()
+    return _session[session_id]
+
+orchestrator = RunnableWithMessageHistory(
+    runnable=dispatcher,
+    get_session_history=_get_history,
+    input_key="input",
+    history_messages_key="history"
+)
+
+cfg = {"configurable": {"session_id": "user1"}}
+
+# Example usage:
+# print(orchestrator.invoke({"input": "What is the capital of France?"}, cfg))
+# print(orchestrator.invoke({"input": "What is 2+2?"}, cfg))
